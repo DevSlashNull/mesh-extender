@@ -34,3 +34,8 @@ umount /serval-var
 umount /dos
 mkfs.ext4 /dev/sda2
 mkfs.ext4 /dev/sda3
+ls -l /dev
+mkdir /serval
+mkdir /serval-var
+mkdir /dos
+ls -l /
