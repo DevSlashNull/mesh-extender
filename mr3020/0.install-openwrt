@@ -1,35 +1,222 @@
-#!/bin/bash
+#!/bin/sh
 
-# Pass the firmware file to be flashed as the first parameter.
-#
-# The second curl call will time out, but it's expected. Once the
-# script exits you can unplug the ethernet cable and proceed to the
-# next router, but KEEP each router ON POWER until the new image is
-# fully written! When flashing is done the router automatically
-# reboots (as shown by all the leds flashing once).
+ME="${0##*/}"
 
-if [ "x$1" == "x" ]; then
-  firmware=openwrt-ar71xx-generic-tl-mr3020-v1-squashfs-factory.bin
-  ip=192.168.0.254
-else
-  firmware=openwrt-ar71xx-generic-$1-v1-squashfs-factory.bin
-  ip=192.168.0.1
+usage() {
+   echo "\
+Usage: $ME [-l|--list]
+       $ME [-p|--probe] [<ipaddr>] ...
+       $ME [-n|--dry-run] <index> [<ipaddr>]
+       $ME [-n|--dry-run] <firmware>.bin <ipaddr>
+
+This script will write a Serval Mesh Extender firmware image to the flash memory
+of an unmodified TP-Link router attached via Ethernet cable at IP address
+<ipaddr>.
+
+Once this script exits you can unplug the Ethernet cable and proceed to the next
+router, but keep the router ON POWER until it flashes all its LEDs once (this
+indicates that the flash has been fully written and the router is rebooting).
+"
+}
+
+seehelp() {
+   echo "Try '$ME --help' for more information."
+}
+
+list_firmware() {
+   if [ -z "$__firmware_files" ]; then
+      __firmware_files=openwrt-ar71xx-smx-*-squashfs-factory.bin
+      index=0
+   else
+      index=$(($index + 1))
+   fi
+   i=0
+   for firmware_bin in $__firmware_files; do
+      if [ $i -eq $index ]; then
+         mesh_extender_version="${firmware_bin#*-smx-}"
+         mesh_extender_version="${mesh_extender_version%%-*}"
+         model="${firmware_bin#*-smx-*-}"
+         model="${model%-squashfs-factory.bin}"
+         return 0
+      fi
+      i=$(($i + 1))
+   done
+   __firmware_files=
+   index=
+   mesh_extender_version=
+   model=
+   return 1
+}
+
+exec 5>&1
+say() {
+   echo "$*" >&5
+}
+
+run() {
+   echo "+ $*" >&5
+   if ! $opt_dryrun; then
+      "$@"
+   fi
+}
+
+opt_dryrun=false
+opt_probe=false
+while [ $# -gt 0 ]; do
+   case "$1" in
+   '' | '-h' | '-?' | '-help' | '--help')
+      usage
+      exit 1
+      ;;
+   -l|--list)
+      while list_firmware; do
+         echo "$index	$mesh_extender_version	$model"
+      done
+      exit 0
+      ;;
+   -n|--dry-run)
+      opt_dryrun=true
+      shift
+      ;;
+   -p|--probe)
+      opt_probe=true
+      shift
+      ;;
+   --)
+      shift
+      break
+      ;;
+   -*)
+      echo "$ME: unsupported option: $1" >&2
+      seehelp >&2
+      exit 1
+      ;;
+   *)
+      break
+      ;;
+   esac
+done
+
+if $opt_probe; then
+   [ $# -eq 0 ] && set 192.168.0.1 192.168.0.254 192.168.1.1 192.168.2.1
+   for ip; do
+   (
+      say "Probe $ip"
+      if html=$(
+            curl \
+               --fail --silent \
+               --max-time 2 \
+               --user admin:admin \
+               --user-agent 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:12.0) Gecko/20100101 Firefox/12.0' \
+               "http://${ip}/userRpm/SoftwareUpgradeRpm.htm"
+         )
+      then
+         case $(echo "$html" | sed -n 1p) in
+         '<SCRIPT language="javascript"'*'>')
+            case $(echo "$html" | sed -n 2p) in
+            'var softUpInf = new Array(')
+               firmware_version=$(echo "$html" | sed -n '3s/^"[  ]*\(.*[^ 	]\)[  ]*",.*$/\1/p')
+               hardware_version=$(echo "$html" | sed -n '4s/^"[  ]*\(.*[^ 	]\)[  ]*",.*$/\1/p')
+               say "Device on $ip is unmodified $hardware_version (vendor firmware $firmware_version)"
+               exit 0
+               ;;
+            esac
+            ;;
+         esac
+      fi
+      exit 1
+   ) &
+   done
+   wait
+   say "No hardware found"
+   exit 5
 fi
-echo "Using firmware file $firmware"
-ls -l $firmware
 
-curl \
-  --user admin:admin \
-  --user-agent 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:12.0) Gecko/20100101 Firefox/12.0' \
-  --referer 'http://${ip}/userRpm/SoftwareUpgradeRpm.htm' \
-  --form "Filename=@$firmware" -F 'Upgrade=Upgrade' \
-  http://${ip}/incoming/Firmware.htm >/dev/null
+if [ $# -eq 0 ]; then
+   echo "$ME: missing argument" >&2
+   seehelp >&2
+   exit 1
+fi
+if [ $# -gt 2 ]; then
+   echo "$ME: spurious arguments" >&2
+   seehelp >&2
+   exit 1
+fi
+case "$1" in
+*.bin)
+   firmware_bin="$1"
+   ip="$2"
+   if ! [ -r "$firmware_bin" ]; then
+      echo "$ME: cannot read firmware file: $firmware_bin" >&2
+      exit 2
+   fi
+   ;;
+*)
+   index_arg="$1"
+   ip="$2"
+   while list_firmware; do
+      [ $index -eq $index_arg ] && break
+   done
+   if [ -z "$firmware_bin" ]; then
+      echo "$ME: no such index: $index_arg" >&2
+      exit 2
+   fi
+   if [ -z "$ip" ]; then
+      case "$model" in
+      tl-mr3020-* | tl-mr3040-*) ip=192.168.0.254;;
+      tl-703n-*) ip=192.168.0.1;;
+      *)
+         echo "$ME: must give <ipaddr> argument for model $model" >&2
+         exit 2
+         ;;
+      esac
+   fi
+   ;;
+esac
+if [ -z "$ip" ]; then
+   echo "$ME: missing <ipaddr> argument" >&2
+   seehelp >&2
+   exit 1
+fi
+if ! run ping -c 1 -w 1 "$ip" >/dev/null; then
+   echo "$ME: cannot ping: $ip" >&2
+   exit 3
+fi
 
-sleep 1
-
-curl \
-  --max-time 2 \
-  --user admin:admin \
-  --user-agent 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:12.0) Gecko/20100101 Firefox/12.0' \
-  --referer 'http://${ip}/incoming/Firmware.htm' \
-  http://${ip}/userRpm/FirmwareUpdateTemp.htm >/dev/null
+set -- $(ls -sh "$firmware_bin")
+say "Upload Mesh Extender $mesh_extender_version firmware for $model ($1) to $ip"
+if http_code=$(
+      run curl \
+         --fail --write-out '%{http_code}' --output /dev/null \
+         --user admin:admin \
+         --user-agent 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:12.0) Gecko/20100101 Firefox/12.0' \
+         --referer 'http://${ip}/userRpm/SoftwareUpgradeRpm.htm' \
+         --form "Filename=@$firmware_bin" --form 'Upgrade=Upgrade' \
+         "http://${ip}/incoming/Firmware.htm"
+   )
+then
+   # The following curl(1) command will time out after 2 seconds, because the
+   # remote end hangs when the router reboots.
+   run sleep 1
+   say "Trigger upgrade $ip"
+   error_html=$(
+      run curl \
+         --max-time 2 --silent \
+         --user admin:admin \
+         --user-agent 'Mozilla/5.0 (X11; Ubuntu; Linux i686; rv:12.0) Gecko/20100101 Firefox/12.0' \
+         --referer 'http://${ip}/incoming/Firmware.htm' \
+         "http://${ip}/userRpm/FirmwareUpdateTemp.htm"
+      )
+   if [ -n "$error_html" ]; then
+      echo "$ME: upgrade of $ip failed" >&2
+      echo "$ME: error code: " $(echo "$error_html" | sed -n -e '/var[ 	]\+errCode[ 	]*=[ 	]*\(.*[^ 	]\)[ 	]*;.*/s//\1/p') >&2
+      exit 5
+   fi
+elif [ "$http_code" = 404 ]; then
+   echo "$ME: router at $ip is not an unmodified $model" >&2
+   exit 4
+else
+   echo "$ME: unexpected failure: HTTP response code $http_code" >&2
+   exit 5
+fi
+exit 0
