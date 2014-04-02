@@ -1,19 +1,81 @@
 #!/usr/bin/env expect
-set timeout 5
+
+# Script for enabling SSH access to a password-less OpenWRT device.
+#
+# A new installation of OpenWRT has no root password, so it only offers a
+# telnet(1) interface.  In order to enable ssh(1) and scp(1) connections to the
+# device, a root password must be set.  If the user has a SSH public key then
+# this script copies it to the OpenWRT device so that the user can henceforward
+# log into it using ssh(1) without typing a password.
+
+# Copyright 2014 Serval Project, Inc.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+
 set ip [lindex $argv 0]
+set newpasswd [lindex $argv 1]
+if { [string length $ip] == 0 } {
+    puts stderr "missing argument 1: IP address of OpenWRT device"
+    exit 1
+}
+if { [string length $newpasswd] == 0 } {
+    set newpasswd "root"
+    puts stderr "missing argument 2: new root password for OpenWRT device"
+    puts stderr "using '$newpasswd'"
+}
+
+set pubkey ''
+foreach name { id_dsa id_rsa } {
+    if { [catch {open $env(HOME)/.ssh/$name.pub r} fd] == 0 } {
+        set pubkey [read -nonewline $fd]
+        close $fd
+        break
+    }
+}
+if { [string length $pubkey] == 0 } {
+    puts stderr "WARNING: cannot find a SSH public key file"
+    puts stderr "You will have to supply a password to log into root@$ip using ssh(1)."
+}
 
 spawn telnet $ip
-expect "'^]'." sleep .1;
-send "\r";
-sleep .1;
+set timeout 5
+expect_after default { send_user "timeout\r"; exit 3 }
+expect "'^]'."
+sleep .1
+send "\r"
+sleep .1
 expect "root@OpenWrt:/#"
-send "cat <<EOF >/etc/dropbear/authorized_keys\r"
-set fd [open $env(HOME)/.ssh/id_rsa.pub r] 
-set pubkey [read -nonewline $fd] 
-close $fd 
-send $pubkey
-send "\rEOF\r"
-expect "root@OpenWrt:/#"
+if { [string length $pubkey] != 0 } {
+    # Have to chunk the public key because the shell on the router has an input
+    # line buffer limit of 511 characters, so we cannot simply use
+    #   send "cat <<EOF >/etc/dropbear/authorized_keys\r"
+    #   send $pubkey
+    #   send "\rEOF\r"
+    # because the public key gets truncated to 511 characters.
+    send ">/etc/dropbear/authorized_keys\r"
+    set chunksize 200
+    for {set offset 0} {$offset < [string length $pubkey]} {set offset [expr $offset + $chunksize]} {
+        set chunk [string range $pubkey $offset [expr $offset + $chunksize - 1]]
+        expect "root@OpenWrt:/#"
+        send "echo -n '$chunk' >>/etc/dropbear/authorized_keys\r"
+    }
+    expect "root@OpenWrt:/#"
+    send "echo >>/etc/dropbear/authorized_keys\r"
+    expect "root@OpenWrt:/#"
+}
 send "passwd\r"
 expect "New password:"
 send "root\r";
@@ -21,3 +83,5 @@ expect "Retype password:"
 send "root\r";
 expect "root@OpenWrt:/#"
 send "exit\r";
+
+exit 0
