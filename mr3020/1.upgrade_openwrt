@@ -1,26 +1,174 @@
-#!/bin/csh -f
+#!/bin/sh
 
-if ( "x$1" == "x" ) then
-  # XXX Assumes the router has DHCP running AND probably that you are on Paul's mac
-  set ip=`ifconfig en0 | grep "inet " | awk '{ print $2;}' | cut -f1-3 -d.`.1
-else
-  set ip=$1
-endif
+# Script for upgrading an OpenWRT TP-Link router to new Serval Mesh Extender
+# OpenWRT firmware.
+
+# Copyright 2014 Serval Project, Inc.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+ME="${0##*/}"
+
+usage() {
+   echo "\
+Usage: $ME [-n|--dry-run] [<ipaddr>] [<firmware>.bin]
+
+This script will upgrade the Serval Mesh Extender firmware image of a TP-Link
+router with Serval Mesh firmware already flashed and running, attached via
+Ethernet cable at IP address <ipaddr>.
+"
+}
+
+seehelp() {
+   echo "Try '$ME --help' for more information."
+}
+
+exec 5>&1
+
+say() {
+   echo "$*" >&5
+}
+
+say_shellquoted() {
+   local arg
+   for arg; do
+      case "$arg" in
+      '' | *[!A-Za-z_0-9.,:=+\/-]* ) echo -n " '$(echo "$arg" | sed -e s/\'/\'\\\\\'\'/g)'" >&5;;
+      *) echo -n " $arg" >&5;;
+      esac
+   done
+   echo >&5
+}
+
+run() {
+   say_shellquoted + "$@"
+   if ! $opt_dryrun; then
+      "$@"
+   fi
+}
+
+opt_dryrun=false
+while [ $# -gt 0 ]; do
+   case "$1" in
+   '' | '-h' | '-?' | '-help' | '--help')
+      usage
+      exit 1
+      ;;
+   -n|--dry-run)
+      opt_dryrun=true
+      shift
+      ;;
+   --)
+      shift
+      break
+      ;;
+   -*)
+      echo "$ME: unsupported option: $1" >&2
+      seehelp >&2
+      exit 1
+      ;;
+   *)
+      break
+      ;;
+   esac
+done
+
+case "$0" in
+*/*) MYDIR="${0%/*}";;
+*) MYDIR=.;;
+esac
+
+export PATH="$PATH:/sbin:/usr/sbin"
+
+if [ $# -gt 2 ]; then
+   echo "$ME: spurious arguments" >&2
+   seehelp >&2
+   exit 1
+fi
+case "$1" in
+*.bin)
+   firmware_bin="$1"
+   ip="$2"
+   ;;
+*)
+   ip="$1"
+   firmware_bin="$2"
+   ;;
+esac
+
+# If no address was given, try to discover the address of the connected router.
+if [ -z "$ip" ]; then
+   # Examine the IP address A.B.C.D of the first Ethernet interface: try eth0 on
+   # Linux systems and if that fails, try en0 on OS X.  If the router acts as a
+   # DHCP server then it probably has the address A.B.C.1 or A.B.C.254.
+   my_ip=$(ifconfig eth0 | sed -n -e '/\<inet\>/s/.*\<addr:\(\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}\)\>.*/\1/p')
+   if [ -z "$my_ip" ]; then
+      my_ip=$(ifconfig en0 | sed -n -e '/\<inet\>/s/.*\<inet *\<\(\([0-9]\{1,3\}\.\)\{3\}[0-9]\{1,3\}\).*\>/\1/p')
+   fi
+   case "$my_ip" in
+   '')
+      echo "$ME: cannot determine IP address of Ethernet interface" >&2
+      exit 2
+      ;;
+   *.1)
+      ip="${my_ip%.*}".254
+      ;;
+   *)
+      ip="${my_ip%.*}".1
+      ;;
+   esac
+   if ! ping -c 1 -w 1 "$ip" >/dev/null; then
+      echo "$ME: ping failed: $ip" >&2
+      exit 2
+   fi
+elif [ -z "$ip" ]; then
+   echo "$ME: empty <ipaddr> argument" >&2
+   seehelp >&2
+   exit 1
+elif ! ping -c 1 -w 1 "$ip" >/dev/null; then
+   echo "$ME: ping failed: $ip" >&2
+   exit 3
+fi
 
 # Try logging in with telnet and setting root password if not already done.
-# Also install our RSA public key to allow password-less login while setting
+# Also install our SSH public key to allow password-less login while setting
 # things up over ssh/scp.
-mr3020-scripts/telnet_set_root_pass ${ip}
+"$MYDIR"/mr3020-scripts/telnet_set_root_pass "$ip" "root"
 
-scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  ~/.ssh/id_rsa.pub  root@${ip}:/etc/dropbear/authorized_keys
+# A short keep-alive interval prevents ssh(1) from hanging for too long if the
+# router reboots and drops the connection.
+ssh_args="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o TCPKeepAlive=yes -o ServerAliveInterval=5"
 
-set model=`ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  -o TCPKeepAlive=yes -o ServerAliveInterval=5  root@${ip} "( . /lib/ar71xx.sh  ; ar71xx_board_name )"`
-echo "Upgrading OpenWRT on the $model at $ip"
+if ! model=$(ssh $ssh_args "root@$ip" "( . /lib/ar71xx.sh; ar71xx_board_name )"); then
+   echo "$ME: cannot connect to $ip using ssh(1)" >&2
+   exit 4
+fi
+if [ -z "$model" ]; then
+   echo "$ME: device at $ip does not appear to be running OpenWRT" >&2
+   exit 5
+fi
 
-if ( "x$2" != "x" ) then
-   set model=$2
-endif
+echo "Device at $ip is OpenWRT model $model"
 
-scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  openwrt-ar71xx-generic-${model}-v1-squashfs-factory.bin root@${ip}:/tmp
-# We use a short keep-alive interval so that ssh realises when the far end has rebooted and dropped the connection.
-ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  -o TCPKeepAlive=yes -o ServerAliveInterval=5  root@${ip} "( cd /tmp ; sysupgrade -v openwrt-ar71xx-generic-${model}-v1-squashfs-factory.bin )"
+if [ -z "$firmware_bin" ]; then
+   firmware_bin="$(echo openwrt-ar71xx-smx-*-$model*-squashfs-factory.bin)"
+fi
+if ! [ -r "$firmware_bin" ]; then
+   echo "$ME: cannot read firmware image: $firmware_bin" >&2
+   exit 6
+fi
+
+run scp $ssh_args "$firmware_bin" "root@$ip:/tmp"
+run ssh $ssh_args "root@$ip" "( cd /tmp && sysupgrade -v '$firmware_bin' )"

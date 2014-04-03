@@ -28,13 +28,12 @@
 set ip [lindex $argv 0]
 set newpasswd [lindex $argv 1]
 if { [string length $ip] == 0 } {
-    puts stderr "missing argument 1: IP address of OpenWRT device"
+    puts stderr "$argv0: missing argument 1: IP address of OpenWRT device"
     exit 1
 }
 if { [string length $newpasswd] == 0 } {
     set newpasswd "root"
-    puts stderr "missing argument 2: new root password for OpenWRT device"
-    puts stderr "using '$newpasswd'"
+    puts stderr "$argv0: missing argument 2: new root password -- using '$newpasswd'"
 }
 
 set pubkey ''
@@ -46,13 +45,23 @@ foreach name { id_dsa id_rsa } {
     }
 }
 if { [string length $pubkey] == 0 } {
-    puts stderr "WARNING: cannot find a SSH public key file"
-    puts stderr "You will have to supply a password to log into root@$ip using ssh(1)."
+    puts stderr "$argv0: WARNING: cannot find a SSH public key file"
+    puts stderr "$argv0: You will have to supply a password to log into root@$ip using ssh(1)."
 }
 
+log_user 0
 spawn telnet $ip
 set timeout 5
-expect_after default { send_user "timeout\r"; exit 3 }
+expect_after {
+    eof {
+        puts stderr "$argv0: telnet failed"
+        exit 3
+    }
+    timeout {
+        puts stderr "$argv0: timeout"
+        exit 3
+    }
+}
 expect "'^]'."
 sleep .1
 send "\r"
@@ -84,4 +93,5 @@ send "root\r";
 expect "root@OpenWrt:/#"
 send "exit\r";
 
+puts stdout "$argv0: successfully set root password"
 exit 0
